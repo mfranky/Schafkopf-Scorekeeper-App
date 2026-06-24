@@ -1,26 +1,31 @@
 import React, { useState } from 'react';
 import { Settings2, X, LogOut } from 'lucide-react';
 import { useSettings } from '../contexts/SettingsContext';
+import { Settings as GameSettings } from '../types';
 
 interface SettingsProps {
   isOpen: boolean;
   onClose: () => void;
   onSignOut: () => void;
+  onSaveSettings?: (settings: GameSettings) => void;
 }
 
-export const Settings: React.FC<SettingsProps> = ({ isOpen, onClose, onSignOut }) => {
+export const Settings: React.FC<SettingsProps> = ({ isOpen, onClose, onSignOut, onSaveSettings }) => {
   const { settings, updateSettings } = useSettings();
   const [localSettings, setLocalSettings] = useState(settings);
 
   if (!isOpen) return null;
 
   const handleSave = () => {
-    updateSettings({
+    const nextSettings = {
       minimumUnit: localSettings.minimumUnit || 10,
       redCardPenalty: localSettings.redCardPenalty || 10,
       enableYellowCards: localSettings.enableYellowCards,
       zeroSumMode: localSettings.zeroSumMode
-    });
+    };
+
+    updateSettings(nextSettings);
+    onSaveSettings?.(nextSettings);
     onClose();
   };
 

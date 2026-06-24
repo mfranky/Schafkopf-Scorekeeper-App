@@ -22,6 +22,20 @@ export interface GameStateTransferData {
   settings: Settings;
 }
 
+export interface GameSessionState {
+  players: Player[];
+  scores: number[][];
+  previousPlayers: PreviousPlayer[];
+  settings: Settings;
+}
+
+export interface OnlineGameSession {
+  id: string;
+  joinCode: string;
+}
+
+export type SyncStatus = 'offline' | 'connecting' | 'online' | 'saving' | 'error';
+
 export interface ScoreInputProps {
   players: Player[];
   onSubmit: (scores: number[]) => void;

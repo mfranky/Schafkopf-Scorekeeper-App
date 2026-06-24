@@ -1,17 +1,24 @@
-import { useState, useEffect } from 'react';
-import { QrCode, Settings2, Users } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Settings2, Users } from 'lucide-react';
 import { PlayerSetup } from './components/PlayerSetup';
 import { ScoreInput } from './components/ScoreInput';
 import { ScoreHistory } from './components/ScoreHistory';
 import { TotalScores } from './components/TotalScores';
 import { Settings } from './components/Settings';
 import { PlayerManagement } from './components/PlayerManagement';
-import { GameTransfer } from './components/GameTransfer';
+import { GameSessionSync } from './components/GameSessionSync';
 import { Footer } from './components/Footer';
 import { Imprint } from './pages/Imprint';
-import { GameStateTransferData, Player, PreviousPlayer } from './types';
+import { GameSessionState, GameStateTransferData, OnlineGameSession, Player, PreviousPlayer, SyncStatus } from './types';
 import { useAuth } from './contexts/AuthContext';
 import { useSettings } from './contexts/SettingsContext';
+import { isFirebaseConfigured } from './lib/firebase';
+import {
+  createGameSession,
+  joinGameSession,
+  subscribeToGameSession,
+  updateGameSessionState,
+} from './services/gameSessionService';
 import { getBobGameState } from './utils/bobGameState';
 import { calculateTotalScores, normalizeRoundScores } from './utils/scoreUtils';
 
@@ -22,6 +29,8 @@ const moveArrayItem = <T,>(items: T[], fromIndex: number, toIndex: number): T[] 
   return updatedItems;
 };
 
+const onlineSessionStorageKey = 'onlineGameSession';
+
 function App() {
   const [players, setPlayers] = useState<Player[]>([]);
   const [previousPlayers, setPreviousPlayers] = useState<PreviousPlayer[]>([]);
@@ -29,7 +38,12 @@ function App() {
   const [showSetup, setShowSetup] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showPlayerManagement, setShowPlayerManagement] = useState(false);
-  const [showGameTransfer, setShowGameTransfer] = useState(false);
+  const [onlineSession, setOnlineSession] = useState<OnlineGameSession | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>('offline');
+  const [syncError, setSyncError] = useState('');
+  const onlineSessionRef = useRef<OnlineGameSession | null>(null);
+  const unsubscribeOnlineSessionRef = useRef<(() => void) | null>(null);
+  const applyingRemoteStateRef = useRef(false);
   const { signOut } = useAuth();
   const { settings, updateSettings } = useSettings();
 
@@ -49,6 +63,93 @@ function App() {
     }
   }, []);
 
+  const persistLocalGameState = useCallback((gameState: GameSessionState) => {
+    setPlayers(gameState.players);
+    setScores(gameState.scores);
+    setPreviousPlayers(gameState.previousPlayers);
+    setShowSetup(gameState.players.length === 0);
+    updateSettings(gameState.settings);
+    localStorage.setItem('players', JSON.stringify(gameState.players));
+    localStorage.setItem('scores', JSON.stringify(gameState.scores));
+    localStorage.setItem('previousPlayers', JSON.stringify(gameState.previousPlayers));
+    localStorage.setItem('schafkopf-settings', JSON.stringify(gameState.settings));
+  }, [updateSettings]);
+
+  const publishOnlineGameState = useCallback((gameState: GameSessionState) => {
+    const activeSession = onlineSessionRef.current;
+
+    if (!activeSession || applyingRemoteStateRef.current) return;
+
+    setSyncStatus('saving');
+    setSyncError('');
+    void updateGameSessionState(activeSession.id, gameState)
+      .then(() => {
+        setSyncStatus('online');
+      })
+      .catch((error) => {
+        setSyncStatus('error');
+        setSyncError(error instanceof Error ? error.message : 'Online session could not be saved.');
+      });
+  }, []);
+
+  const saveGameState = useCallback((gameState: GameSessionState) => {
+    persistLocalGameState(gameState);
+    publishOnlineGameState(gameState);
+  }, [persistLocalGameState, publishOnlineGameState]);
+
+  const applyRemoteGameState = useCallback((gameState: GameSessionState) => {
+    applyingRemoteStateRef.current = true;
+    persistLocalGameState(gameState);
+    setSyncStatus('online');
+    setSyncError('');
+    window.setTimeout(() => {
+      applyingRemoteStateRef.current = false;
+    }, 0);
+  }, [persistLocalGameState]);
+
+  const connectOnlineSession = useCallback((session: OnlineGameSession) => {
+    unsubscribeOnlineSessionRef.current?.();
+    onlineSessionRef.current = session;
+    setOnlineSession(session);
+    setSyncStatus('connecting');
+    setSyncError('');
+    localStorage.setItem(onlineSessionStorageKey, JSON.stringify(session));
+
+    unsubscribeOnlineSessionRef.current = subscribeToGameSession(
+      session.id,
+      (remoteState, remoteSession) => {
+        onlineSessionRef.current = remoteSession;
+        setOnlineSession(remoteSession);
+        localStorage.setItem(onlineSessionStorageKey, JSON.stringify(remoteSession));
+        applyRemoteGameState(remoteState);
+      },
+      (error) => {
+        setSyncStatus('error');
+        setSyncError(error.message);
+      }
+    );
+  }, [applyRemoteGameState]);
+
+  useEffect(() => {
+    if (!isFirebaseConfigured) return;
+
+    const storedOnlineSession = localStorage.getItem(onlineSessionStorageKey);
+    if (!storedOnlineSession) return;
+
+    try {
+      const parsedSession = JSON.parse(storedOnlineSession) as OnlineGameSession;
+      if (parsedSession.id && parsedSession.joinCode) {
+        connectOnlineSession(parsedSession);
+      }
+    } catch {
+      localStorage.removeItem(onlineSessionStorageKey);
+    }
+
+    return () => {
+      unsubscribeOnlineSessionRef.current?.();
+    };
+  }, [connectOnlineSession]);
+
   const handlePlayerSetup = (playerNames: string[]) => {
     if (playerNames.length === 1 && playerNames[0].toLowerCase() === 'bob') {
       handleImportGameState(getBobGameState());
@@ -62,25 +163,51 @@ function App() {
       sittingOut: false
     }));
 
-    setPlayers(newPlayers);
-    setScores([]);
-    setPreviousPlayers([]);
-    setShowSetup(false);
-    localStorage.setItem('players', JSON.stringify(newPlayers));
-    localStorage.setItem('scores', JSON.stringify([]));
-    localStorage.setItem('previousPlayers', JSON.stringify([]));
+    saveGameState({
+      players: newPlayers,
+      scores: [],
+      previousPlayers: [],
+      settings,
+    });
   };
 
   const handleImportGameState = (gameState: GameStateTransferData) => {
-    setPlayers(gameState.players);
-    setScores(gameState.scores);
-    setPreviousPlayers(gameState.previousPlayers);
-    setShowSetup(gameState.players.length === 0);
-    updateSettings(gameState.settings);
-    localStorage.setItem('players', JSON.stringify(gameState.players));
-    localStorage.setItem('scores', JSON.stringify(gameState.scores));
-    localStorage.setItem('previousPlayers', JSON.stringify(gameState.previousPlayers));
-    localStorage.setItem('schafkopf-settings', JSON.stringify(gameState.settings));
+    saveGameState({
+      players: gameState.players,
+      scores: gameState.scores,
+      previousPlayers: gameState.previousPlayers,
+      settings: gameState.settings,
+    });
+  };
+
+  const handleCreateOnlineSession = async () => {
+    const session = await createGameSession({
+      players,
+      scores,
+      previousPlayers,
+      settings,
+    });
+
+    connectOnlineSession(session);
+  };
+
+  const handleJoinOnlineSession = async (joinCode: string) => {
+    setSyncStatus('connecting');
+    setSyncError('');
+
+    const { session, state } = await joinGameSession(joinCode);
+    connectOnlineSession(session);
+    applyRemoteGameState(state);
+  };
+
+  const handleLeaveOnlineSession = () => {
+    unsubscribeOnlineSessionRef.current?.();
+    unsubscribeOnlineSessionRef.current = null;
+    onlineSessionRef.current = null;
+    setOnlineSession(null);
+    setSyncStatus('offline');
+    setSyncError('');
+    localStorage.removeItem(onlineSessionStorageKey);
   };
 
   const path = window.location.pathname;
@@ -89,20 +216,16 @@ function App() {
   if (showSetup) {
     return (
       <>
-        <PlayerSetup
-          onSubmit={handlePlayerSetup}
-          onImportClick={() => setShowGameTransfer(true)}
-        />
-        <GameTransfer
-          isOpen={showGameTransfer}
-          onClose={() => setShowGameTransfer(false)}
-          players={[]}
-          scores={[]}
-          previousPlayers={[]}
-          settings={settings}
-          onImport={handleImportGameState}
-          showExport={false}
-        />
+        <PlayerSetup onSubmit={handlePlayerSetup}>
+          <GameSessionSync
+            isConfigured={isFirebaseConfigured}
+            activeSession={onlineSession}
+            syncStatus={syncStatus}
+            syncError={syncError}
+            onJoin={handleJoinOnlineSession}
+            onLeave={handleLeaveOnlineSession}
+          />
+        </PlayerSetup>
       </>
     );
   }
@@ -121,11 +244,16 @@ function App() {
           scoreHistory[roundIndex] ?? 0
         ])
       : scores;
+    const updatedPreviousPlayers = scoreHistory
+      ? previousPlayers.filter(player => player.name.toLowerCase() !== name.toLowerCase())
+      : previousPlayers;
 
-    setPlayers(updatedPlayers);
-    setScores(updatedScores);
-    localStorage.setItem('players', JSON.stringify(updatedPlayers));
-    localStorage.setItem('scores', JSON.stringify(updatedScores));
+    saveGameState({
+      players: updatedPlayers,
+      scores: updatedScores,
+      previousPlayers: updatedPreviousPlayers,
+      settings,
+    });
   };
 
   const handleRemovePlayer = (index: number) => {
@@ -144,26 +272,21 @@ function App() {
       initialScore: playerToRemove.score
     };
     const updatedPreviousPlayers = [...previousPlayers, newPreviousPlayer];
-    setPreviousPlayers(updatedPreviousPlayers);
-    localStorage.setItem('previousPlayers', JSON.stringify(updatedPreviousPlayers));
 
     // Remove player from active list
     const updatedPlayers = players.filter((_, i) => i !== index);
-    setPlayers(updatedPlayers);
-    localStorage.setItem('players', JSON.stringify(updatedPlayers));
 
     // Remove player's scores from history
     const updatedScores = normalizedScores.map(roundScores =>
       roundScores.filter((_, i) => i !== index)
     );
-    setScores(updatedScores);
-    localStorage.setItem('scores', JSON.stringify(updatedScores));
-  };
 
-  const handleRemovePreviousPlayer = (name: string) => {
-    const updatedPreviousPlayers = previousPlayers.filter(p => p.name !== name);
-    setPreviousPlayers(updatedPreviousPlayers);
-    localStorage.setItem('previousPlayers', JSON.stringify(updatedPreviousPlayers));
+    saveGameState({
+      players: updatedPlayers,
+      scores: updatedScores,
+      previousPlayers: updatedPreviousPlayers,
+      settings,
+    });
   };
 
   const handleReorderPlayers = (fromIndex: number, toIndex: number) => {
@@ -182,24 +305,29 @@ function App() {
       moveArrayItem(normalizeRoundScores(roundScores, players.length), fromIndex, toIndex)
     );
 
-    setPlayers(updatedPlayers);
-    setScores(updatedScores);
-    localStorage.setItem('players', JSON.stringify(updatedPlayers));
-    localStorage.setItem('scores', JSON.stringify(updatedScores));
+    saveGameState({
+      players: updatedPlayers,
+      scores: updatedScores,
+      previousPlayers,
+      settings,
+    });
   };
 
   const handleScoreSubmit = (newScores: number[]) => {
     const updatedScores = [...scores, newScores];
-    setScores(updatedScores);
-    localStorage.setItem('scores', JSON.stringify(updatedScores));
 
     // Update sitting out status
     const nextPlayers = players.map((player, i) => ({
       ...player,
       sittingOut: i > 0 ? players[i-1].sittingOut : players[players.length-1].sittingOut
     }));
-    setPlayers(nextPlayers);
-    localStorage.setItem('players', JSON.stringify(nextPlayers));
+
+    saveGameState({
+      players: nextPlayers,
+      scores: updatedScores,
+      previousPlayers,
+      settings,
+    });
   };
 
   const handleYellowCard = (playerIndex: number) => {
@@ -208,34 +336,55 @@ function App() {
         ? { ...player, yellowCard: !player.yellowCard }
         : player
     );
-    setPlayers(updatedPlayers);
-    localStorage.setItem('players', JSON.stringify(updatedPlayers));
+    saveGameState({
+      players: updatedPlayers,
+      scores,
+      previousPlayers,
+      settings,
+    });
   };
 
   const handleSittingOutChange = (playerIndex: number, value: boolean) => {
-    const updatedPlayers = [...players];
-    updatedPlayers[playerIndex].sittingOut = value;
-    setPlayers(updatedPlayers);
-    localStorage.setItem('players', JSON.stringify(updatedPlayers));
+    const updatedPlayers = players.map((player, index) =>
+      index === playerIndex ? { ...player, sittingOut: value } : player
+    );
+    saveGameState({
+      players: updatedPlayers,
+      scores,
+      previousPlayers,
+      settings,
+    });
   };
 
   const handleRemoveLastScore = () => {
     if (scores.length === 0) return;
     const newScores = scores.slice(0, -1);
-    setScores(newScores);
-    localStorage.setItem('scores', JSON.stringify(newScores));
+    saveGameState({
+      players,
+      scores: newScores,
+      previousPlayers,
+      settings,
+    });
   };
 
   const handleNewGame = () => {
     if (confirm('Start a new game? This will reset all scores.')) {
-      setShowSetup(true);
-      setPlayers([]);
-      setScores([]);
-      setPreviousPlayers([]);
-      localStorage.removeItem('players');
-      localStorage.removeItem('scores');
-      localStorage.removeItem('previousPlayers');
+      saveGameState({
+        players: [],
+        scores: [],
+        previousPlayers: [],
+        settings,
+      });
     }
+  };
+
+  const handleSaveSettings = (nextSettings: GameSessionState['settings']) => {
+    saveGameState({
+      players,
+      scores,
+      previousPlayers,
+      settings: nextSettings,
+    });
   };
 
   return (
@@ -252,13 +401,6 @@ function App() {
               >
                 <Users className="h-5 w-5 text-gray-400" />
               </button>
-              <button
-                onClick={() => setShowGameTransfer(true)}
-                className="p-2 hover:bg-gray-800/50 rounded-lg transition-colors"
-                title="Transfer game"
-              >
-                <QrCode className="h-5 w-5 text-gray-400" />
-              </button>
             </div>
             <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-400 to-blue-600 bg-clip-text text-transparent">
               Scorekeeper
@@ -274,6 +416,18 @@ function App() {
             </div>
           </div>
         </header>
+
+        <div className="mb-8">
+          <GameSessionSync
+            isConfigured={isFirebaseConfigured}
+            activeSession={onlineSession}
+            syncStatus={syncStatus}
+            syncError={syncError}
+            onCreate={handleCreateOnlineSession}
+            onJoin={handleJoinOnlineSession}
+            onLeave={handleLeaveOnlineSession}
+          />
+        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
           <TotalScores 
@@ -303,24 +457,14 @@ function App() {
           previousPlayers={previousPlayers}
           onAddPlayer={handleAddPlayer}
           onRemovePlayer={handleRemovePlayer}
-          onRemovePreviousPlayer={handleRemovePreviousPlayer}
           onReorderPlayers={handleReorderPlayers}
-        />
-
-        <GameTransfer
-          isOpen={showGameTransfer}
-          onClose={() => setShowGameTransfer(false)}
-          players={players}
-          scores={scores}
-          previousPlayers={previousPlayers}
-          settings={settings}
-          onImport={handleImportGameState}
         />
 
         <Settings
           isOpen={showSettings}
           onClose={() => setShowSettings(false)}
           onSignOut={signOut}
+          onSaveSettings={handleSaveSettings}
         />
 
         <Footer />

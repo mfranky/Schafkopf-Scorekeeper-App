@@ -23,7 +23,6 @@ interface PlayerManagementProps {
   previousPlayers: PreviousPlayer[];
   onAddPlayer: (name: string, initialScore?: number, scoreHistory?: number[]) => void;
   onRemovePlayer: (index: number) => void;
-  onRemovePreviousPlayer: (name: string) => void;
   onReorderPlayers: (fromIndex: number, toIndex: number) => void;
   isOpen: boolean;
   onClose: () => void;
@@ -100,7 +99,6 @@ export const PlayerManagement: React.FC<PlayerManagementProps> = ({
   previousPlayers,
   onAddPlayer,
   onRemovePlayer,
-  onRemovePreviousPlayer,
   onReorderPlayers,
   isOpen,
   onClose,
@@ -161,7 +159,6 @@ export const PlayerManagement: React.FC<PlayerManagementProps> = ({
       getPreviousPlayerInitialScore(restoreCandidate),
       restoreCandidate.scoreHistory
     );
-    onRemovePreviousPlayer(restoreCandidate.name);
     setRestoreCandidate(null);
     setNewPlayerName('');
   };
